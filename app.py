@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv(override=False)
 import time
 import socket
+import subprocess
 from wakeonlan import send_magic_packet
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
@@ -68,14 +69,13 @@ def prometheus_metrics():
     lines.append("# TYPE tv_muted gauge")
     lines.append(f"tv_muted {muted}")
 
-    # Current channel / app
-    channel_title = _current_content.get("title", "") or "unknown"
-    channel_source = _current_content.get("source", "") or "unknown"
-    channel_uri = _current_content.get("uri", "") or ""
+    # Current channel / app — query live so metrics are always fresh
+    now_playing = _resolve_current_content()
+    now_playing_escaped = now_playing.replace('"', '\\"')
 
-    lines.append("# HELP tv_current_channel Current TV channel or app")
-    lines.append("# TYPE tv_current_channel gauge")
-    lines.append(f'tv_current_channel{{title="{channel_title}",source="{channel_source}",uri="{channel_uri}"}} 1')
+    lines.append("# HELP tv_now_playing Current TV channel or app (merged string)")
+    lines.append("# TYPE tv_now_playing gauge")
+    lines.append(f'tv_now_playing{{label="{now_playing_escaped}"}} 1')
 
     return Response("\n".join(lines) + "\n", mimetype="text/plain; version=0.0.4; charset=utf-8")
 
@@ -83,6 +83,7 @@ def prometheus_metrics():
 SONY_TV_IP = os.getenv('SONY_TV_IP')
 SONY_TV_MAC = os.getenv('SONY_TV_MAC')
 PSK = os.getenv('SONY_TV_PSK')
+ADB_PORT = os.getenv('SONY_TV_ADB_PORT', '5555')
 
 # Track the last switched content (since the TV API can't report the active app)
 _current_content = {"title": None, "source": None, "uri": None}
@@ -295,19 +296,15 @@ def _get_hdmi_labels():
                 labels[inp["uri"]] = inp.get("label", "")
     return labels
 
-@app.route('/api/channel')
-def get_channel():
-    """Get current channel/input information.
-    
-    Strategy:
-      1. Try getPlayingContentInfo — works for HDMI, TV and some apps.
-      2. Fall back to server-side tracked content (set when user
-         switches input or launches an app through our API).
+def _resolve_current_content():
+    """Query the TV for what's playing, update _current_content, and return
+    a single merged display string:  'Title / Source'  (or just 'Title').
     """
     global _current_content
 
-    # 1) Try getPlayingContentInfo (works for HDMI, TV, etc.)
+    # --- Step 1: getPlayingContentInfo ---
     result = make_sony_api_request("avContent", "getPlayingContentInfo")
+    print(f"[channel] getPlayingContentInfo → {result}")
     if result["success"] and "result" in result["data"]:
         content_info = result["data"]["result"][0] if result["data"]["result"] else {}
         title = content_info.get("title", "") or ""
@@ -320,31 +317,82 @@ def get_channel():
             if uri in labels and labels[uri]:
                 title = labels[uri]
 
-        # If title is still empty, derive a friendly name from the URI
+        # Derive a friendly name from the URI if title is still empty
         if not title and uri:
             title = _friendly_input_name(uri) or uri
 
         if title:
-            # Update tracker so it stays current
+            print(f"[channel] resolved via getPlayingContentInfo: {title!r} / {source!r}")
             _current_content = {"title": title, "source": source or "Input", "uri": uri}
-            return jsonify({
-                "success": True,
-                "title": title,
-                "uri": uri,
-                "source": source or "Input"
-            })
+            # Skip step 2 — we already have a result
+            title = _current_content.get("title") or "Unknown"
+            source = _current_content.get("source") or ""
+            return f"{title} / {source}" if source and source not in ("Unknown", title) else title
 
-    # 2) Fallback: use server-side tracked content
-    if _current_content["title"]:
-        return jsonify({
-            "success": True,
-            "title": _current_content["title"],
-            "uri": _current_content.get("uri", ""),
-            "source": _current_content.get("source", "App")
-        })
+    # --- Step 2: ADB Fallback (Active App) ---
+    # Sony's API doesn't report the foreground app, but Android TV ADB does.
+    print(f"[channel] getPlayingContentInfo yielded nothing, trying ADB...")
+    try:
+        # Ensure we are connected
+        subprocess.run(["adb", "connect", f"{SONY_TV_IP}:{ADB_PORT}"], capture_output=True, timeout=2)
+        
+        # This dumpsys command extracts the focused activity package name
+        # e.g., mCurrentFocus=Window{... u0 com.netflix.ninja/com.netflix.ninja.MainActivity}
+        cmd = ["adb", "-s", f"{SONY_TV_IP}:{ADB_PORT}", "shell", "dumpsys", "activity", "activities", "|", "grep", "mResumedActivity"]
+        # On newer Androids mResumedActivity is reliable, but let's just grab the whole block and parse safely.
+        # Actually a simpler cross-version way: dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'
+        dump_cmd = "adb -s " + f"{SONY_TV_IP}:{ADB_PORT}" + " shell dumpsys window windows | grep -i 'mCurrentFocus'"
+        proc = subprocess.run(dump_cmd, shell=True, capture_output=True, text=True, timeout=3)
+        
+        output = proc.stdout.strip()
+        print(f"[channel] ADB mCurrentFocus output: {output!r}")
+        
+        if output and "u0 " in output:
+            # Parse `u0 com.google.android.youtube.tv/...`
+            pkg_part = output.split("u0 ")[-1].split("/")[0].strip()
+            # Clean up trailing braces if present
+            pkg_part = pkg_part.replace('}', '')
+            
+            if pkg_part:
+                # If we know the friendly name via our app cache or heuristic:
+                app_name = _resolve_app_name(pkg_part)
+                if "nba" in app_name.lower():
+                    app_name = "NBA"
+                
+                # Check if we have the real title in _icon_cache (which maps uri -> icon)
+                # App URIs look like com.sony.dtv.com.netflix.ninja.com.netflix.ninja.MainActivity
+                # We can do a fuzzy match against the package
+                global _icon_cache
+                if not _icon_cache:
+                    # trigger fetch invisibly if empty
+                    make_sony_api_request("appControl", "getApplicationList") # we just need it loaded later, not strictly now
+                    
+                print(f"[channel] ADB detected active package: {pkg_part} -> resolved to {app_name!r}")
+                _current_content = {"title": app_name, "source": "App", "uri": pkg_part}
+                return app_name
+                
+    except Exception as e:
+        print(f"[channel] ADB fallback failed: {e}")
 
-    # 3) Nothing detected
-    return jsonify({"success": True, "title": "Unknown", "uri": "", "source": "Unknown"})
+    print(f"[channel] no signal from TV via API or ADB; using tracker: {_current_content}")
+
+    # --- Step 3: fall back to in-memory tracker ---
+    title = _current_content.get("title") or "Unknown"
+    source = _current_content.get("source") or ""
+    return f"{title} / {source}" if source and source not in ("Unknown", title) else title
+
+
+@app.route('/api/channel')
+def get_channel():
+    """Get current channel/input information."""
+    _resolve_current_content()  # refreshes _current_content from TV
+    title = _current_content.get("title") or "Unknown"
+    return jsonify({
+        "success": True,
+        "title": title,
+        "uri": _current_content.get("uri", ""),
+        "source": _current_content.get("source", "Unknown")
+    })
 
 @app.route('/api/inputs/hdmi')
 def get_hdmi_inputs():

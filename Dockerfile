@@ -10,17 +10,14 @@ RUN yarn build
 FROM python:3.12-slim
 WORKDIR /app
 
-# Install Python dependencies
+RUN apt-get update && apt-get install -y android-tools-adb && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt gunicorn
 
-# Copy backend
 COPY app.py ./
 
-# Copy built frontend from stage 1
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
-# Copy device icons
 COPY frontend/public/icons ./frontend/dist/icons
 
 EXPOSE 5000
