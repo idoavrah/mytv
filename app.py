@@ -73,9 +73,9 @@ def prometheus_metrics():
     now_playing = _resolve_current_content()
     now_playing_escaped = now_playing.replace('"', '\\"')
 
-    lines.append("# HELP tv_now_playing Current TV channel or app (merged string)")
+    lines.append("# HELP tv_now_playing Current TV channel or app")
     lines.append("# TYPE tv_now_playing gauge")
-    lines.append(f'tv_now_playing{{label="{now_playing_escaped}"}} 1')
+    lines.append(f'tv_now_playing{{title="{now_playing_escaped}"}} 1')
 
     return Response("\n".join(lines) + "\n", mimetype="text/plain; version=0.0.4; charset=utf-8")
 
@@ -298,13 +298,12 @@ def _get_hdmi_labels():
 
 def _resolve_current_content():
     """Query the TV for what's playing, update _current_content, and return
-    a single merged display string:  'Title / Source'  (or just 'Title').
+    just the title (e.g. 'Netflix' or 'HDMI 1').
     """
     global _current_content
 
     # --- Step 1: getPlayingContentInfo ---
     result = make_sony_api_request("avContent", "getPlayingContentInfo")
-    print(f"[channel] getPlayingContentInfo → {result}")
     if result["success"] and "result" in result["data"]:
         content_info = result["data"]["result"][0] if result["data"]["result"] else {}
         title = content_info.get("title", "") or ""
@@ -322,16 +321,12 @@ def _resolve_current_content():
             title = _friendly_input_name(uri) or uri
 
         if title:
-            print(f"[channel] resolved via getPlayingContentInfo: {title!r} / {source!r}")
             _current_content = {"title": title, "source": source or "Input", "uri": uri}
             # Skip step 2 — we already have a result
-            title = _current_content.get("title") or "Unknown"
-            source = _current_content.get("source") or ""
-            return f"{title} / {source}" if source and source not in ("Unknown", title) else title
+            return _current_content.get("title") or "Unknown"
 
     # --- Step 2: ADB Fallback (Active App) ---
     # Sony's API doesn't report the foreground app, but Android TV ADB does.
-    print(f"[channel] getPlayingContentInfo yielded nothing, trying ADB...")
     try:
         # Ensure we are connected
         subprocess.run(["adb", "connect", f"{SONY_TV_IP}:{ADB_PORT}"], capture_output=True, timeout=2)
@@ -343,9 +338,7 @@ def _resolve_current_content():
         # Actually a simpler cross-version way: dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'
         dump_cmd = "adb -s " + f"{SONY_TV_IP}:{ADB_PORT}" + " shell dumpsys window windows | grep -i 'mCurrentFocus'"
         proc = subprocess.run(dump_cmd, shell=True, capture_output=True, text=True, timeout=3)
-        
         output = proc.stdout.strip()
-        print(f"[channel] ADB mCurrentFocus output: {output!r}")
         
         if output and "u0 " in output:
             # Parse `u0 com.google.android.youtube.tv/...`
@@ -367,19 +360,13 @@ def _resolve_current_content():
                     # trigger fetch invisibly if empty
                     make_sony_api_request("appControl", "getApplicationList") # we just need it loaded later, not strictly now
                     
-                print(f"[channel] ADB detected active package: {pkg_part} -> resolved to {app_name!r}")
                 _current_content = {"title": app_name, "source": "App", "uri": pkg_part}
                 return app_name
                 
-    except Exception as e:
-        print(f"[channel] ADB fallback failed: {e}")
-
-    print(f"[channel] no signal from TV via API or ADB; using tracker: {_current_content}")
-
-    # --- Step 3: fall back to in-memory tracker ---
-    title = _current_content.get("title") or "Unknown"
-    source = _current_content.get("source") or ""
-    return f"{title} / {source}" if source and source not in ("Unknown", title) else title
+    except Exception:
+        pass
+    
+    return _current_content.get("title") or "Unknown"
 
 
 @app.route('/api/channel')
@@ -390,8 +377,7 @@ def get_channel():
     return jsonify({
         "success": True,
         "title": title,
-        "uri": _current_content.get("uri", ""),
-        "source": _current_content.get("source", "Unknown")
+        "uri": _current_content.get("uri", "")
     })
 
 @app.route('/api/inputs/hdmi')
