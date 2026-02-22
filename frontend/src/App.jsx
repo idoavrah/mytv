@@ -39,60 +39,51 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState(null);
 
-  // Fetch TV status
   const fetchStatus = async () => {
     try {
       setError(null);
-      const [statusRes, volumeRes, channelRes] = await Promise.allSettled([
-        api.get("/api/status"),
-        api.get("/api/volume"),
-        api.get("/api/channel"),
-      ]);
+      const res = await api.get("/api/status");
 
-      setTvStatus((prev) => {
-        const newStatus = { ...prev };
+      if (res.data && res.data.success) {
+        setTvStatus((prev) => {
+          const power = res.data.power || "offline";
+          const newStatus = {
+            ...prev,
+            power: power,
+            volume: res.data.volume ?? prev.volume,
+            muted: res.data.muted ?? prev.muted,
+            channel: res.data.title || "Unknown",
+            currentUri: res.data.uri || "",
+            // Use title as application if channel is Unknown, otherwise it's self-contained
+            application: res.data.title || "Unknown",
+          };
 
-        if (statusRes.status === "fulfilled" && statusRes.value.data.success) {
-          newStatus.power = statusRes.value.data.status;
-          setConnected(true);
-        } else {
-          newStatus.power = "offline";
-          setConnected(false);
-        }
+          if (power === "active") {
+            setConnected(true);
+          } else {
+            setConnected(false);
+            // Reset fields on standby/offline
+            newStatus.volume = 0;
+            newStatus.muted = false;
+            newStatus.channel = "—";
+            newStatus.application = "—";
+            newStatus.currentUri = "";
+          }
 
-        // When TV is not active, reset volume/channel/uri
-        if (newStatus.power !== "active") {
-          newStatus.volume = 0;
-          newStatus.muted = false;
-          newStatus.channel = "—";
-          newStatus.application = "Unknown";
-          newStatus.currentUri = "";
           return newStatus;
-        }
+        });
 
-        if (volumeRes.status === "fulfilled" && volumeRes.value.data.success) {
-          newStatus.volume = volumeRes.value.data.volume || 0;
-          newStatus.muted = volumeRes.value.data.muted || false;
-        }
-
-        if (
-          channelRes.status === "fulfilled" &&
-          channelRes.value.data.success
-        ) {
-          newStatus.channel = channelRes.value.data.title || "Unknown";
-          newStatus.application = channelRes.value.data.source || "Unknown";
-          newStatus.currentUri = channelRes.value.data.uri || "";
-        }
-
-        return newStatus;
-      });
-      setLastUpdate(
-        new Date().toLocaleTimeString("de-DE", {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-        }),
-      );
+        setLastUpdate(
+          new Date().toLocaleTimeString("de-DE", {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          }),
+        );
+      } else {
+        setConnected(false);
+        setTvStatus((prev) => ({ ...prev, power: "offline" }));
+      }
     } catch (error) {
       console.error("Error fetching status:", error);
       setError("Failed to fetch TV status");
@@ -131,13 +122,13 @@ function App() {
         // Refresh volume info
         setTimeout(() => {
           api
-            .get("/api/volume")
+            .get("/api/status")
             .then((res) => {
               if (res.data.success) {
                 setTvStatus((prev) => ({
                   ...prev,
-                  volume: res.data.volume || 0,
-                  muted: res.data.muted || false,
+                  volume: res.data.volume ?? prev.volume,
+                  muted: res.data.muted ?? prev.muted,
                 }));
               }
             })
@@ -197,7 +188,7 @@ function App() {
         // Only show HDMI 1 (PS5) and HDMI 2 (Switch)
         const filtered = res.data.inputs.filter(
           (inp) =>
-            (inp.label || inp.connected) &&
+            (inp.label || inp.displayName || inp.connected) &&
             !inp.uri.includes("port=3") &&
             !inp.uri.includes("port=4"),
         );

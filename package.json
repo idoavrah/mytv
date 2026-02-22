@@ -1,0 +1,12 @@
+{
+  "name": "mytv-root",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "concurrently -n \"SERVER,CLIENT\" -c \"magenta,cyan\" \".venv/bin/python app.py\" \"cd frontend && yarn dev\"",
+    "install-all": "yarn install && cd frontend && yarn install"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

@@ -13,8 +13,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y android-tools-adb && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt gunicorn
-
-COPY app.py ./
+COPY *.py ./
 
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
