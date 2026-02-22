@@ -58,7 +58,7 @@ def prometheus_metrics():
 
     lines.append("# HELP tv_power_status TV power state (1=active, 0.5=standby, 0=off)")
     lines.append("# TYPE tv_power_status gauge")
-    lines.append(f'tv_power_status{{state="{power_status}"}} {power_val}')
+    lines.append(f'tv_power_status {power_val}')
 
     # Volume
     volume = status.get("volume", 0)
